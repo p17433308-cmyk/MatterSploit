@@ -1,0 +1,474 @@
+================================================================================
+  MatterSploit: Offensive Security Framework for Matter Smart Home
+  Protocol and Thread Mesh Networks
+================================================================================
+
+  Dr. Sapna V M
+  Associate Professor, Department of Computer Science
+  PES University, Bengaluru, India
+
+  Source: https://github.com/p17433308-cmyk/MatterSploit
+
+--------------------------------------------------------------------------------
+ABSTRACT
+--------------------------------------------------------------------------------
+Matter is the unified smart home protocol adopted by Apple, Google, Amazon,
+and Samsung, deployed on hundreds of millions of devices worldwide. The
+protocol was designed to unify the fragmented IoT ecosystem with end-to-end
+encryption using CASE (Certificate Authenticated Session Establishment) and
+PASE (Passcode Authenticated Session Establishment). However, critical
+portions of the Matter protocol stack — Status Reports, Message Counter
+Synchronization, and the commissioning handshake initiation — operate without
+authentication, creating a significant attack surface.
+
+We present MatterSploit, the first open-source offensive security framework, to our knowledge,
+targeting the Matter protocol and its underlying Thread mesh network layer.
+MatterSploit implements complete protocol stacks for Matter message framing,
+TLV encoding, IEEE 802.15.4 frame construction, Thread MLE (Mesh Link
+Establishment), BLE commissioning transport, and the Matter Interaction Model.
+It provides seven network-layer attacks (MaDoS flood, CASE session exhaustion,
+PASE PBKDF flood, message counter desynchronization, Thread beacon spoofing,
+MLE discovery flood, PAN ID conflict), three BLE commissioning attacks
+(advertisement spoofing, passcode bruteforce analysis, PASE BLE flood), seven
+Interaction Model attacks (subscription flood, attribute enumeration, door lock
+unlock, thermostat setpoint manipulation, toggle flood, timed interaction race,
+ACL probe), a protocol-aware fuzzer with CVE reproducers, mDNS device
+discovery, and passive forensic collection with anomaly detection.
+
+All attacks build real protocol packets from scratch using only the Python
+standard library — no simulation, no hardcoded data, no third-party
+dependencies.
+
+--------------------------------------------------------------------------------
+1. INTRODUCTION
+--------------------------------------------------------------------------------
+The Matter protocol (formerly Project CHIP — Connected Home over IP) was
+ratified by the Connectivity Standards Alliance in 2022 as the universal smart
+home standard. Major implementations include Apple HomeKit, Google Home,
+Amazon Alexa, and Samsung SmartThings. Matter runs over Wi-Fi, Thread, and
+Ethernet at the network layer, using IPv6 multicast and UDP port 5540 for
+device communication.
+
+The security model relies on:
+  * CASE (Certificate Authenticated Session Establishment) for secure sessions
+    between commissioned devices using fabric-scoped NOC (Node Operational
+    Certificates)
+  * PASE (Passcode Authenticated Session Establishment) for commissioning
+    new devices using a 20-bit setup passcode and SPAKE2+ PBKDF
+  * MRP (Message Reliability Protocol) with message counters for replay
+    protection and reliability
+
+However, several protocol mechanisms operate outside the encryption boundary:
+  * Status Reports are transmitted unencrypted and unauthenticated
+  * Message Counter Synchronization Requests are processed before session
+    validation
+  * PASE PBKDF Parameter Requests initiate CPU-intensive PBKDF2 computation
+    before any authentication
+  * CASE Sigma1 messages allocate session state before mutual authentication
+
+These design decisions create zero-authentication attack vectors that an
+adversary on the local network can exploit without possessing any
+cryptographic material, commissioning credentials, or fabric membership.
+
+At the Thread layer, IEEE 802.15.4 beacon frames and MLE discovery messages
+are similarly transmitted without authentication during the network joining
+phase, enabling mesh network infiltration.
+
+Contributions:
+  * The first comprehensive open-source offensive security framework, to our knowledge, for Matter and Thread,
+    implementing full protocol stacks for packet construction and parsing.
+  * Seven network-layer attacks exploiting unauthenticated Matter and Thread
+    protocol mechanisms.
+  * Three BLE commissioning attacks targeting the Matter BLE transport layer.
+  * Seven Interaction Model attacks targeting Matter's application-layer
+    data model, including subscription exhaustion and device manipulation.
+  * A protocol-aware fuzzer with 25 test cases including CVE-2025-56364 and
+    CVE-2025-56365 reproducers.
+  * mDNS-based device discovery with full DNS response parsing.
+  * Passive forensic collection with five anomaly detectors.
+
+--------------------------------------------------------------------------------
+2. BACKGROUND
+--------------------------------------------------------------------------------
+2.1 Matter Protocol Architecture
+A Matter message consists of a Message Header (flags byte encoding version,
+source/destination presence, and DSIZ field; session ID; security flags;
+message counter; optional source and destination node IDs) followed by a
+Protocol Header (exchange flags, opcode, exchange ID, protocol ID, optional
+acknowledged message counter) and the payload.
+
+The Matter specification defines four protocol IDs:
+  * 0x0000 — Secure Channel (CASE, PASE, MRP, Status Reports)
+  * 0x0001 — Interaction Model (read, write, subscribe, invoke)
+  * 0x0002 — BDX (Bulk Data Exchange)
+  * 0x0003 — User Directed Commissioning
+
+The Interaction Model uses TLV (Tag-Length-Value) encoding with 13 type codes:
+signed/unsigned integers (1/2/4/8 byte), booleans, floats, doubles, UTF-8
+strings, byte strings, null, structures, arrays, lists, and end-of-container.
+
+2.2 Thread Mesh Network
+Thread is an IEEE 802.15.4-based mesh network protocol. An IEEE 802.15.4
+frame begins with a Frame Control Field (frame type, security enabled, frame
+pending, ACK request, PAN ID compression, addressing modes), sequence number,
+destination PAN ID and address, source PAN ID and address, and payload.
+
+Thread uses MLE (Mesh Link Establishment) for neighbor discovery and link
+management. MLE defines 18 command types and 21 TLV types for exchanging
+network parameters. During the joining phase, MLE Discovery Request and
+Response messages are transmitted without link-layer encryption.
+
+2.3 BLE Commissioning
+Matter devices advertise over BLE using service UUID 0xFFF6. The advertisement
+contains the device discriminator (12-bit), vendor ID, and product ID. The
+commissioning passcode is a 20-bit value (~1 million combinations), used as
+input to SPAKE2+ with PBKDF2 key derivation. BLE Transport Protocol (BTP)
+frames carry PASE handshake messages over GATT characteristics.
+
+2.4 Threat Model
+The attacker is on the same local network as Matter devices (Wi-Fi or Thread
+network access). For network-layer attacks, no authentication material is
+required — the attacker needs only UDP connectivity to port 5540. For Thread
+attacks, the attacker needs an IEEE 802.15.4 radio within range. For BLE
+attacks, the attacker needs BLE radio proximity during commissioning. For
+Interaction Model attacks, the attacker needs local network access to send
+crafted TLV-encoded messages.
+
+--------------------------------------------------------------------------------
+3. FRAMEWORK ARCHITECTURE
+--------------------------------------------------------------------------------
+MatterSploit is organized into protocol implementations, attack modules,
+discovery, forensics, and CLI:
+
+  mattersploit/
+    protocols/
+      matter.py              Matter message framing, TLV encoding, types
+      thread.py              IEEE 802.15.4, MLE, Thread beacons
+    attacks/
+      matter_attacks.py      MaDoS, session flood, counter desync, Thread
+      ble_attacks.py         BLE advertisement spoofing, PASE flood
+      interaction_attacks.py Subscription flood, enumeration, device attacks
+      fuzzer.py              Protocol-aware fuzzer with CVE reproducers
+    discovery/
+      scanner.py             mDNS device discovery
+    forensics/
+      collector.py           Passive collection and anomaly detection
+    cli.py                   attack / fuzz / forensics / scan / ble / interact / demo
+
+Dependencies: none. Pure Python standard library.
+
+--------------------------------------------------------------------------------
+4. PROTOCOL IMPLEMENTATIONS
+--------------------------------------------------------------------------------
+4.1 Matter Message Builder
+The Matter protocol module implements complete message construction:
+  * MatterMessageHeader and MatterProtocolHeader as dataclasses with all
+    specification-defined fields
+  * build_message_header() serializes the flags byte with version (bits 4-7),
+    source node present (bit 2), DSIZ field (bits 0-1), and security flags
+  * build_protocol_header() serializes exchange flags, opcode, exchange ID,
+    and protocol ID
+  * build_status_report() constructs General Code + Protocol ID + Protocol
+    Code triplets as defined in the Matter specification
+  * build_matter_message() composes the full wire-format packet
+  * parse_message_header() deserializes received packets
+  * TLV encoders: encode_tlv_unsigned (auto-selects 1/2/4/8 byte width),
+    encode_tlv_string, encode_tlv_bytes
+
+4.2 Thread Protocol Builder
+The Thread module implements:
+  * IEEE802154Frame dataclass with all frame control fields
+  * build_ieee802154_frame() constructs frames with proper FCF encoding,
+    addressing modes, and PAN ID compression
+  * ThreadBeacon dataclass with protocol ID, network name, XPANID, and flags
+  * build_thread_beacon() wraps beacon payload in IEEE 802.15.4 beacon frames
+  * build_mle_discovery_request/response() construct MLE command frames with
+    TLV-encoded parameters
+  * build_beacon_request() for IEEE 802.15.4 beacon request command frames
+
+4.3 Interaction Model Builder
+The Interaction Model module implements the full TLV-encoded request builders:
+  * Container helpers: _tlv_structure_begin, _tlv_list_begin, _tlv_array_begin,
+    _tlv_end for nested TLV construction
+  * Path builders: _build_attribute_path (endpoint, cluster, attribute),
+    _build_command_path (endpoint, cluster, command)
+  * Request builders: build_read_request, build_subscribe_request,
+    build_write_request, build_invoke_request, build_timed_request
+  * Well-known cluster/attribute/command IDs: OnOff (0x0006), DoorLock
+    (0x0101), Thermostat (0x0201), AccessControl (0x001F), and more
+
+4.4 BLE Transport Builder
+The BLE module implements:
+  * MatterBLEAdvertisement dataclass with discriminator, vendor ID, product
+    ID, and commissioning mode
+  * build_spoofed_matter_adv() constructs BLE advertisement payloads matching
+    the Matter BLE service format (UUID 0xFFF6)
+  * parse_matter_ble_adv() extracts discriminator and vendor info from
+    captured advertisements
+  * BTP (BLE Transport Protocol) header framing for PASE handshake transport
+
+--------------------------------------------------------------------------------
+5. NETWORK-LAYER ATTACKS
+--------------------------------------------------------------------------------
+5.1 MaDoS — Matter Denial of Service (Zero Authentication)
+Status Reports in the Matter Secure Channel protocol are processed without
+encryption or authentication. MaDoS floods the target with BUSY Status Reports
+(General Code 1, Protocol Code 0x009C), causing the device to back off
+communication with all peers. The attack builds complete Matter messages with
+randomized message counters and sends them over UDP to port 5540.
+
+Impact: Network-wide communication disruption. All devices on the fabric
+experience communication failures as the target stops responding.
+
+5.2 Message Counter Desynchronization
+Matter MRP uses monotonically increasing message counters for replay
+protection. By sending a counter sync request with message_counter near the
+maximum value (0xFFFFFFFE), the attacker forces the target to update its
+expected counter window. Subsequent legitimate messages from the real
+controller are rejected as replays.
+
+5.3 PASE PBKDF Flood
+PASE commissioning begins with a PBKDF Parameter Request that triggers
+CPU-intensive PBKDF2-HMAC-SHA256 computation on the target device. This
+computation occurs before any authentication. Flooding the target with
+PBKDF Parameter Requests exhausts CPU resources and blocks legitimate
+commissioning attempts.
+
+5.4 CASE Sigma1 Flood
+Each CASE Sigma1 message allocates a session context on the target device.
+Devices have limited session tables (typically 8-16 entries). Flooding with
+Sigma1 messages from random session IDs exhausts the session table, preventing
+any new secure session establishment.
+
+5.5 Thread Beacon Spoofing
+IEEE 802.15.4 beacon frames are transmitted without authentication. The attack
+constructs spoofed beacons advertising a fake Thread network with an attractive
+network name and XPANID, luring scanning devices to attempt joining the
+attacker's network.
+
+5.6 MLE Discovery Flood
+During Thread network joining, MLE Discovery Requests are processed without
+link-layer encryption. Flooding the Border Router with discovery requests
+exhausts CPU and memory resources allocated for the joining process.
+
+5.7 PAN ID Conflict
+IEEE 802.15.4 networks identify themselves by PAN ID. Transmitting beacons
+with the target network's PAN ID but different security parameters triggers
+the Thread PAN ID conflict resolution process, potentially forcing a
+network-wide PAN ID change that disrupts all communications.
+
+--------------------------------------------------------------------------------
+6. BLE COMMISSIONING ATTACKS
+--------------------------------------------------------------------------------
+6.1 Advertisement Spoofing
+The attacker crafts fake Matter BLE advertisements matching the target device's
+discriminator and vendor information. Commissioning apps discover the spoofed
+advertisement and attempt to commission the attacker's device instead.
+
+6.2 Passcode Bruteforce Analysis
+The Matter 20-bit passcode provides approximately 1 million combinations.
+MatterSploit calculates the effective search space accounting for invalid
+passcodes (all-zeros, sequential digits) and estimates bruteforce time at
+various attempt rates.
+
+6.3 PASE BLE Flood
+Floods the target device's BLE interface with PASE handshake initiation
+messages over BTP (BLE Transport Protocol), exhausting the device's BLE
+connection slots and preventing legitimate commissioning.
+
+--------------------------------------------------------------------------------
+7. INTERACTION MODEL ATTACKS
+--------------------------------------------------------------------------------
+7.1 Subscription Flood
+Matter devices support a limited number of concurrent subscriptions (typically
+3-5). Each Subscribe Request allocates a subscription context. Flooding with
+subscribe requests targeting different attributes exhausts all slots, blocking
+legitimate controller subscriptions and breaking automation rules.
+
+7.2 Attribute Read Enumeration
+Systematically sends Read Requests across all standard cluster IDs and
+attribute IDs for each endpoint, mapping the device's complete data model.
+Reveals supported clusters, readable attributes, and endpoint configuration.
+
+7.3 Door Lock Unlock
+Sends an Invoke Request targeting the DoorLock cluster (0x0101) with the
+UnlockDoor command (0x01). The TLV-encoded request includes the proper
+endpoint path and command path. If access controls are misconfigured or
+the device lacks proper ACL enforcement, this opens the lock.
+
+7.4 Thermostat Setpoint Manipulation
+Sends Write Requests to the Thermostat cluster (0x0201) modifying
+OccupiedHeatingSetpoint and OccupiedCoolingSetpoint attributes to extreme
+values (e.g., 50°C heating, 5°C cooling), causing energy waste and discomfort.
+
+7.5 Toggle Flood
+Rapidly sends alternating On/Off Toggle commands to the OnOff cluster
+(0x0006), causing physical relay cycling on smart switches and potentially
+damaging connected equipment through rapid power cycling.
+
+7.6 Timed Interaction Race
+Matter's timed interaction flow separates the Timed Request (which starts a
+timer) from the subsequent Write or Invoke. The attack sends rapid alternating
+Timed Request and Invoke pairs, attempting to win race conditions in the
+timed action validation logic.
+
+7.7 ACL Probe
+Enumerates Access Control List entries by reading the ACL attribute (0x0000)
+from the AccessControl cluster (0x001F), revealing which subjects have what
+privileges on which endpoints — a prerequisite for privilege escalation.
+
+--------------------------------------------------------------------------------
+8. PROTOCOL FUZZING
+--------------------------------------------------------------------------------
+The MatterFuzzer generates 25 protocol-level test cases:
+
+8.1 Matter Message Header (13 cases)
+  * Invalid protocol versions (0x0, 0x8, 0xC)
+  * Maximum session ID (0xFFFF)
+  * Maximum message counter (0xFFFFFFFF)
+  * All security flags set
+  * Invalid DSIZ values
+  * Group-addressed messages without group ID
+  * Truncated messages (header only, no payload)
+  * Oversized payload (64KB)
+  * Source + destination node IDs with all flags
+
+8.2 PASE Fuzzing (5 cases)
+  * PBKDF iterations = 0 (bypass)
+  * PBKDF iterations = 1 (bypass)
+  * PBKDF iterations = 2^31-1 (CPU DoS)
+  * Invalid PAKE1 elliptic curve point
+  * Empty PAKE2 payload (null dereference)
+
+8.3 CASE Fuzzing (3 cases)
+  * Oversized Sigma1 destination ID (1KB — buffer overflow in HKDF)
+  * Malformed Sigma2 certificate (ASN.1 parser crash)
+  * Invalid session resume for non-existent session (use-after-free)
+
+8.4 Thread Fuzzing (4 cases)
+  * Oversized IEEE 802.15.4 frame (256 bytes — exceeds max frame size)
+  * Invalid MLE version
+  * Empty IEEE 802.15.4 frame (minimum-length parse failure)
+  * Invalid frame type in FCF
+
+8.5 CVE Reproducers
+  * CVE-2025-56365: Invoke Request targeting nonexistent endpoint 0xFFFF,
+    causing SIGABRT in the Matter SDK's endpoint resolution
+  * CVE-2025-56364: Group-addressed Status Report with uninitialized group
+    ID, causing SIGABRT in group message handling
+
+--------------------------------------------------------------------------------
+9. DEVICE DISCOVERY
+--------------------------------------------------------------------------------
+The mDNS scanner discovers Matter devices on the local network:
+
+  * Queries _matter._tcp.local (commissioned devices) and _matterc._udp.local
+    (devices in commissioning mode) via multicast UDP (224.0.0.251:5353)
+  * Implements full DNS response parsing including pointer compression for
+    name decompression
+  * Extracts TXT record fields: VP (Vendor+Product ID), DT (Device Type),
+    DN (Device Name), SII (Session Idle Interval), SAI (Session Active
+    Interval), PH (Pairing Hint), PI (Pairing Instruction)
+  * Returns MatterDeviceInfo with IP, port, and all discovered metadata
+
+--------------------------------------------------------------------------------
+10. FORENSIC COLLECTION
+--------------------------------------------------------------------------------
+The forensic collector performs passive analysis of Matter traffic:
+
+10.1 Anomaly Detectors
+  * Unsecured Status Reports (MaDoS detection) — flags session_id=0 messages
+    with Secure Channel protocol and Status Report opcode
+  * Counter Near Maximum — detects message counters above 0xFFFFFFF0,
+    indicating desynchronization attack or counter exhaustion
+  * Excessive Sigma1 — counts CASE handshake initiations per source; flags
+    when a single source sends more than the threshold, indicating session
+    exhaustion attack
+  * Unknown Fabric — identifies messages from unknown fabric IDs that do not
+    match the monitored network's fabric
+  * Beacon Anomaly — detects Thread beacons with suspicious node identifiers
+    or network parameters indicating spoofing
+
+10.2 Device Tracking
+For each observed source, the collector maintains: node ID, IP address,
+message count, session IDs, message types seen, first/last seen timestamps,
+and message counter ranges.
+
+10.3 Reporting
+Generates structured reports with summary statistics (devices discovered,
+sessions observed, total messages, anomalies detected), per-device details,
+and anomaly list with severity classification (critical, warning, info).
+
+--------------------------------------------------------------------------------
+11. EVALUATION
+--------------------------------------------------------------------------------
+We validated MatterSploit with a test suite of 28 cases covering:
+  * Matter message construction and round-trip parsing (4 tests)
+  * TLV encoding for all integer widths, bytes, and strings (6 tests)
+  * Forensic collector packet processing and anomaly detection (2 tests)
+  * Interaction Model request builders and attack classes (5 tests)
+  * BLE advertisement construction and attack classes (2 tests)
+  * mDNS query builder and TXT record parser (2 tests)
+  * Module exports — 42 symbols across all sub-packages (2 tests)
+  * Thread beacon, MLE discovery, and IEEE 802.15.4 frame builders (3 tests)
+  * Protocol fuzzer generation and CVE reproducers (2 tests)
+
+The demo command exercises the complete pipeline: constructs real Matter
+attack packets (MaDoS, counter desync, PASE PBKDF, CASE Sigma1) with hex
+wire dumps, builds Thread attack frames (beacon spoof, MLE flood, PAN
+conflict), generates 25 protocol fuzz cases with severity ratings, and
+feeds all packets through the forensic collector for anomaly detection.
+
+All output is real protocol data — every byte is a valid (or deliberately
+malformed) Matter/Thread/BLE frame constructed from the protocol
+specification.
+
+--------------------------------------------------------------------------------
+12. RESPONSIBLE USE
+--------------------------------------------------------------------------------
+MatterSploit is intended for authorized security testing only: testing your
+own Matter/Thread devices and infrastructure, authorized penetration testing
+engagements, and security research. The demo command operates without any
+target device. Network attacks require explicit target specification and
+should only be executed in controlled test environments.
+
+The attacks implemented in MatterSploit exploit fundamental protocol design
+decisions — unauthenticated Status Reports, pre-authentication resource
+allocation, and unencrypted mesh joining — that affect every Matter-compliant
+device. Responsible disclosure of new vulnerabilities discovered with this
+framework is essential.
+
+--------------------------------------------------------------------------------
+13. CONCLUSION
+--------------------------------------------------------------------------------
+The Matter protocol's security model contains fundamental gaps at the
+pre-authentication boundary. Status Reports, counter synchronization, PASE
+initiation, and CASE session allocation all operate without authentication,
+enabling zero-credential attacks that disrupt entire smart home networks. At
+the Thread layer, unencrypted beacon and MLE discovery frames enable mesh
+network infiltration. At the application layer, the Interaction Model's
+subscription limits and device-specific commands create additional attack
+vectors.
+
+MatterSploit provides the first systematic open-source offensive security framework, to our knowledge, for
+this protocol stack: complete protocol builders for Matter, Thread, BLE, and
+the Interaction Model; 17 attack modules across four layers; protocol-aware
+fuzzing with CVE reproducers; mDNS discovery; and passive forensic
+collection. It enables security researchers to assess and improve the
+security of the billions of Matter devices being deployed worldwide.
+
+--------------------------------------------------------------------------------
+REFERENCES (SELECTED)
+--------------------------------------------------------------------------------
+  [1] Matter Specification v1.3 — Connectivity Standards Alliance
+  [2] Thread Specification v1.3.0 — Thread Group
+  [3] IEEE 802.15.4 — Low-Rate Wireless Networks
+  [4] MaDoS: Matter Denial of Service — ASIACCS 2026
+  [5] CVE-2025-56364 — Matter SDK uninitialized group ID (SIGABRT)
+  [6] CVE-2025-56365 — Matter SDK nonexistent endpoint assertion (SIGABRT)
+  [7] CASE Protocol — Matter Secure Channel Specification, Section 4.13
+  [8] PASE Protocol — Matter Secure Channel Specification, Section 4.14
+  [9] BLE Transport Protocol — Matter Core Specification, Section 4.18
+  [10] Interaction Model — Matter Core Specification, Chapter 8
+
+================================================================================
